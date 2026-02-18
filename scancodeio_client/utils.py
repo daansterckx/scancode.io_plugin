@@ -3,7 +3,7 @@ Utility functions for working with ScanCode.io results.
 """
 
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Union
 import json
 
 from .models import ScanResult, FileResult, Package

@@ -1,0 +1,14 @@
+README.md
+setup.py
+scancodeio_client/__init__.py
+scancodeio_client/async_client.py
+scancodeio_client/client.py
+scancodeio_client/exceptions.py
+scancodeio_client/models.py
+scancodeio_client/utils.py
+scancodeio_client.egg-info/PKG-INFO
+scancodeio_client.egg-info/SOURCES.txt
+scancodeio_client.egg-info/dependency_links.txt
+scancodeio_client.egg-info/entry_points.txt
+scancodeio_client.egg-info/requires.txt
+scancodeio_client.egg-info/top_level.txt

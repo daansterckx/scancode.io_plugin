@@ -1,123 +1,114 @@
-version: '3.8'
-
 services:
-  db:
-    image: postgres:15-alpine
-    container_name: scancodeio-db
-    environment:
-      POSTGRES_DB: scancodeio
-      POSTGRES_USER: scancodeio
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+  # --- Existing ScanCode.io Logic ---
+  db-check:
+    image: docker.io/library/postgres:17
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - db_data:/var/lib/postgresql/data/:ro
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        DATA_DIR="/var/lib/postgresql/data"
+        if [ ! -f "$$DATA_DIR/PG_VERSION" ]; then exit 0; fi
+        OLD_VERSION=$$(cat "$$DATA_DIR/PG_VERSION")
+        if [ "$$OLD_VERSION" -lt 17 ]; then exit 1; fi
+    restart: "no"
+
+  db:
+    image: docker.io/library/postgres:17
+    depends_on:
+      db-check:
+        condition: service_completed_successfully
+    env_file:
+      - docker.env
+    volumes:
+      - db_data:/var/lib/postgresql/data/
+    shm_size: "3gb"
+    restart: always
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U scancodeio -d scancodeio"]
+      test: [ "CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}" ]
       interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - scancodeio-network
-    restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
-    container_name: scancodeio-redis
+    image: docker.io/library/redis:latest
+    command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - scancodeio-network
-    restart: unless-stopped
+    restart: always
+
+  chown:
+    image: docker.io/library/alpine:latest
+    restart: "no"
+    command: sh -c "chown -R ${APP_UID:-1000}:${APP_GID:-1000} /var/scancodeio/"
+    env_file:
+      - docker.env
+    volumes:
+      - static:/var/scancodeio/static/
+      - workspace:/var/scancodeio/workspace/
 
   web:
-    image: nexb/scancode.io:latest
-    container_name: scancodeio-web
-    command: sh -c '
-      /bin/sh docker-entrypoint.sh migrate &&
-      /bin/sh docker-entrypoint.sh collectstatic --noinput &&
-      gunicorn scancodeio.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 300'
-    environment:
-      - DEBUG=${DEBUG:-False}
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
-      - DATABASE_URL=postgres://scancodeio:${DB_PASSWORD:-changeme}@db:5432/scancodeio
-      - REDIS_URL=redis://redis:6379/0
-      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1,*}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
-      - CSRF_TRUSTED_ORIGINS=${CSRF_TRUSTED_ORIGINS:-}
-      - SCANCODEIO_WORKSPACE_LOCATION=/var/scancodeio/workspace
-      - SCANCODEIO_CACHE_LOCATION=/var/scancodeio/cache
+    build: .
+    command: sh -c "./manage.py migrate && ./manage.py collectstatic --no-input && gunicorn scancodeio.wsgi:application --bind :8000 --timeout 600"
+    env_file:
+      - docker.env
+    expose:
+      - 8000
     volumes:
-      - scancodeio_workspace:/var/scancodeio/workspace
-      - scancodeio_static:/app/staticfiles
-    ports:
-      - "${WEB_PORT:-8000}:8000"
+      - .env:/opt/scancodeio/.env
+      - workspace:/var/scancodeio/workspace/
+      - static:/var/scancodeio/static/
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - scancodeio-network
-    restart: unless-stopped
+      db: { condition: service_healthy }
+      redis: { condition: service_started }
 
   worker:
-    image: nexb/scancode.io:latest
-    container_name: scancodeio-worker
-    command: sh -c '/bin/sh docker-entrypoint.sh rqworker --queue-class scancodeio.core.queues.WorkerUUIDQueue'
-    environment:
-      - DEBUG=${DEBUG:-False}
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
-      - DATABASE_URL=postgres://scancodeio:${DB_PASSWORD:-changeme}@db:5432/scancodeio
-      - REDIS_URL=redis://redis:6379/0
-      - SCANCODEIO_WORKSPACE_LOCATION=/var/scancodeio/workspace
-      - SCANCODEIO_CACHE_LOCATION=/var/scancodeio/cache
-      - SCANCODEIO_WORKER_TIMEOUT=${WORKER_TIMEOUT:-3600}
+    build: .
+    command: wait-for-it --strict web:8000 -- ./manage.py rqworker
+    env_file:
+      - docker.env
     volumes:
-      - scancodeio_workspace:/var/scancodeio/workspace
-      - scancodeio_cache:/var/scancodeio/cache
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - scancodeio-network
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: ${WORKER_MEMORY_LIMIT:-8G}
+      - .env:/opt/scancodeio/.env
+      - workspace:/var/scancodeio/workspace/
+    depends_on: [ redis, db, web ]
 
-  # Optional: Nginx reverse proxy (recommended for production)
-  nginx:
-    image: nginx:alpine
-    container_name: scancodeio-nginx
-    ports:
-      - "${NGINX_PORT:-80}:80"
-      - "${NGINX_SSL_PORT:-443}:443"
+  # --- DejaCode Addition ---
+  dejacode-db:
+    image: docker.io/library/postgres:15 # DejaCode often prefers 15
+    environment:
+      - POSTGRES_DB=dejacode
+      - POSTGRES_USER=deja
+      - POSTGRES_PASSWORD=deja_pass
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
-      - scancodeio_static:/var/www/static:ro
+      - dejacode_db_data:/var/lib/postgresql/data/
+    restart: always
+
+  dejacode:
+    image: ghcr.io/aboutcode-org/dejacode:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - ALLOWED_HOSTS=*
+      - DATABASE_URL=postgres://deja:deja_pass@dejacode-db:5432/dejacode
+      - CSRF_COOKIE_SECURE=False
+      - SESSION_COOKIE_SECURE=False
+      - SCANCODEIO_URL=http://web:8000/
+    depends_on:
+      - dejacode-db
+
+  # --- Global Access ---
+  nginx:
+    image: docker.io/library/nginx:alpine
+    ports:
+      - "${NGINX_PUBLISHED_HTTP_PORT:-80}:80"
+    volumes:
+      - ./etc/nginx/conf.d/:/etc/nginx/conf.d/
+      - static:/var/scancodeio/static/
     depends_on:
       - web
-    networks:
-      - scancodeio-network
-    restart: unless-stopped
-    profiles:
-      - production
+    restart: always
 
 volumes:
-  postgres_data:
+  db_data:
+  dejacode_db_data:
   redis_data:
-  scancodeio_workspace:
-  scancodeio_static:
-  scancodeio_cache:
-
-networks:
-  scancodeio-network:
-    driver: bridge
+  static:
+  workspace:
